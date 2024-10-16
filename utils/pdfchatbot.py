@@ -117,7 +117,7 @@ class PDFChatBot:
             model=self.model,
             task='text-generation',
             tokenizer=self.tokenizer,
-            max_new_tokens=32768
+            max_new_tokens=1024
         )
         self.pipeline = HuggingFacePipeline(pipeline=pipe)
 

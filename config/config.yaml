@@ -1,11 +1,11 @@
 # config/config.yaml
 
 model:
-  name_or_path: "/home/projects/PolicyChatbot/models/Qwen2.5-7B-Instruct"
-  tokenizer_name_or_path: "/home/projects/PolicyChatbot/models/Qwen2.5-7B-Instruct"
+  name_or_path: "models/Qwen2.5-7B-Instruct"
+  tokenizer_name_or_path: "models/Qwen2.5-7B-Instruct"
 
 embeddings:
-  model_name: "/home/projects/PolicyChatbot/models/paraphrase-multilingual-MiniLM-L12-v2"
+  model_name: "models/paraphrase-multilingual-MiniLM-L12-v2"
 
 vector_store:
   index_path: "data/vector_index"

@@ -11,7 +11,12 @@ from langchain.chains import ConversationalRetrievalChain
 from langchain.document_loaders import PyPDFLoader
 from langchain.prompts import PromptTemplate
 from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
-
+from transformers import TextIteratorStreamer
+from utils.streaming_callback import StreamingCallbackHandler
+import asyncio
+from queue import Queue, Empty
+import threading
+from models.customLLM import CustomHFStreamingLLM
 class PDFChatBot:
     def __init__(self, config_path="config/config.yaml"):
         """
@@ -104,31 +109,29 @@ class PDFChatBot:
         self.model = AutoModelForCausalLM.from_pretrained(
             self.config.model.name_or_path,
             device_map='auto',
-            torch_dtype=torch.float32,
+            torch_dtype='auto',
             token=True,
             load_in_8bit=False
         )
 
-    def create_pipeline(self):
+    def create_llm(self):
         """
-        Create a pipeline for text generation using the loaded model and tokenizer.
+        Create a custom LLM that supports streaming.
         """
-        pipe = pipeline(
-            model=self.model,
-            task='text-generation',
-            tokenizer=self.tokenizer,
-            max_new_tokens=32768
+        self.llm = CustomHFStreamingLLM(
+            model_name=self.config.model.name_or_path,
+            tokenizer_name=self.config.model.tokenizer_name_or_path
         )
-        self.pipeline = HuggingFacePipeline(pipeline=pipe)
+
 
     def create_chain(self):
         """
         Create a Conversational Retrieval Chain
         """
         self.chain = ConversationalRetrievalChain.from_llm(
-            self.pipeline,
+            llm=self.llm,
             chain_type="stuff",
-            retriever=self.vectordb.as_retriever(search_kwargs={"k": 1}),
+            retriever=self.vectordb.as_retriever(search_kwargs={"k": 3}),
             condense_question_prompt=self.prompt,
             return_source_documents=True
         )
@@ -144,9 +147,8 @@ class PDFChatBot:
         self.documents = PyPDFLoader(file.name).load()
         self.load_embeddings()
         self.load_vectordb()
-        self.load_tokenizer()
-        self.load_model()
-        self.create_pipeline()
+
+        self.create_llm()
         self.create_chain()
 
     def generate_response(self, history, query, file):
@@ -169,13 +171,26 @@ class PDFChatBot:
             self.process_file(file)
             self.processed = True
 
-        result = self.chain({"question": query, 'chat_history': self.chat_history}, return_only_outputs=True)
-        self.chat_history.append((query, result["answer"]))
-        self.page = list(result['source_documents'][0])[1][1]['page']
 
-        for char in result['answer']:
-            history[-1][-1] += char
-        return history, " "
+        queue = Queue()
+        callback = StreamingCallbackHandler(queue)
+
+        def run_chain():
+            self.chain({"question": query, "chat_history": self.chat_history}, return_only_outputs=True, callbacks=[callback])
+
+        threading.Thread(target=run_chain).start()
+
+        partial_answer = ""
+        while True:
+            try:
+                token = queue.get(timeout=5)
+                partial_answer += token
+                self.chat_history.append((query, partial_answer))
+                yield self.chat_history, " "
+            except Empty:
+                break
+
+        
 
     def render_file(self, file):
         """

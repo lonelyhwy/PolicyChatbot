@@ -4,19 +4,22 @@ import torch
 import gradio as gr
 from PIL import Image
 from easydict import EasyDict
-from langchain.embeddings import HuggingFaceEmbeddings
-from langchain.vectorstores import Chroma
-from langchain.llms import HuggingFacePipeline
-from langchain.chains import ConversationalRetrievalChain
-from langchain.document_loaders import PyPDFLoader
+from langchain_community.embeddings.huggingface import HuggingFaceEmbeddings
+from langchain_community.vectorstores import Chroma
+from langchain_huggingface import HuggingFacePipeline
+from langchain.chains.conversational_retrieval.base import ConversationalRetrievalChain
+from langchain_community.document_loaders import PyPDFLoader
 from langchain.prompts import PromptTemplate
 from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
 from transformers import TextIteratorStreamer
 from utils.streaming_callback import StreamingCallbackHandler
-import asyncio
-from queue import Queue, Empty
-import threading
-from models.customLLM import CustomHFStreamingLLM
+from langchain.callbacks.base import BaseCallbackHandler
+from queue import Queue, Empty, SimpleQueue
+from threading import Thread
+from langchain_community.llms.ollama import Ollama
+
+from langchain_community.chat_models.openai import ChatOpenAI
+
 class PDFChatBot:
     def __init__(self, config_path="config/config.yaml"):
         """
@@ -38,6 +41,20 @@ class PDFChatBot:
         self.model = None
         self.pipeline = None
         self.chain = None
+        self.queue = SimpleQueue()
+        self.job_done = object()
+        self.callback = StreamingCallbackHandler(self.queue, self.job_done)
+
+        # load all components
+        self.create_prompt_template()
+       
+        self.load_embeddings()
+        # self.process_file() # load documents
+        
+        # self.load_tokenizer()
+        # self.load_model()
+        self.create_pipeline()
+        
 
     def load_config(self, file_path):
         """
@@ -114,14 +131,41 @@ class PDFChatBot:
             load_in_8bit=False
         )
 
-    def create_llm(self):
+    def create_pipeline(self):
         """
-        Create a custom LLM that supports streaming.
+        Create a pipeline for text generation using the loaded model and tokenizer.
         """
-        self.llm = CustomHFStreamingLLM(
-            model_name=self.config.model.name_or_path,
-            tokenizer_name=self.config.model.tokenizer_name_or_path
-        )
+        # self.streamer = TextIteratorStreamer(self.tokenizer, skip_prompt=True)
+        # pipe = pipeline(
+        #     'text-generation',
+        #     model=self.model,
+        #     tokenizer=self.tokenizer,
+        #     max_new_tokens=200,
+        #     streamer=self.streamer,
+        #     # eos_token_id=self.tokenizer.eos_token_id,
+        #     # callbacks=[self.callback] # pipeline cannot support callbacks
+            
+        # )
+
+        
+        # self.pipeline = HuggingFacePipeline(pipeline=pipe ,
+        #                                     callbacks=[self.callback])
+        ########### 2 openai
+    #     openai_api_key="sk-w507f36f57b39fd8e218d5825a631d784bcf0870753V94it"
+        
+    #     self.pipeline = ChatOpenAI(
+    #     temperature=0,
+    #     openai_api_key=openai_api_key,
+    #     streaming=True,
+    #     callbacks=[StreamingCallbackHandler(self.queue, self.job_done)],
+    #     base_url="https://api.gptsapi.net/v1"
+    # )
+    ############# 3 ollama
+
+        self.pipeline = Ollama(model="qwen2.5:7b",
+                               callbacks=[self.callback],
+                               )
+
 
 
     def create_chain(self):
@@ -129,11 +173,12 @@ class PDFChatBot:
         Create a Conversational Retrieval Chain
         """
         self.chain = ConversationalRetrievalChain.from_llm(
-            llm=self.llm,
+            llm=self.pipeline,
             chain_type="stuff",
-            retriever=self.vectordb.as_retriever(search_kwargs={"k": 3}),
+            retriever=self.vectordb.as_retriever(search_kwargs={"k": 1}),
             condense_question_prompt=self.prompt,
-            return_source_documents=True
+            return_source_documents=True,
+            # callbacks=[self.callback]
         )
 
     def process_file(self, file):
@@ -142,14 +187,22 @@ class PDFChatBot:
 
         Parameters:
             file (FileStorage): The uploaded PDF file.
-        """
-        self.create_prompt_template()
-        self.documents = PyPDFLoader(file.name).load()
-        self.load_embeddings()
-        self.load_vectordb()
 
-        self.create_llm()
+        """
+        self.documents=PyPDFLoader(file.name).load()
+        self.load_vectordb()
         self.create_chain()
+
+
+    def process_query(self, query):
+        result = self.chain({"question": query, "chat_history": self.chat_history}, 
+                            return_only_outputs=True,
+                            # callbacks=[self.callback]
+                            )
+        self.chat_history.append((query, result["answer"]))
+        return result["answer"]
+
+
 
     def generate_response(self, history, query, file):
         """
@@ -172,23 +225,27 @@ class PDFChatBot:
             self.processed = True
 
 
-        queue = Queue()
-        callback = StreamingCallbackHandler(queue)
+        # queue = SimpleQueue()
+        # callback = StreamingCallbackHandler(queue)
+        # def run_chain():
+        #     self.chain({"question": query, "chat_history": self.chat_history}, return_only_outputs=True, callbacks=[callback])
 
-        def run_chain():
-            self.chain({"question": query, "chat_history": self.chat_history}, return_only_outputs=True, callbacks=[callback])
+        # user_input = history[-1][0]
+        thread = Thread(target=self.process_query, args=(query,))
+        thread.start()
+        history[-1][1] = ""
 
-        threading.Thread(target=run_chain).start()
-
-        partial_answer = ""
+        
         while True:
             try:
-                token = queue.get(timeout=5)
-                partial_answer += token
-                self.chat_history.append((query, partial_answer))
-                yield self.chat_history, " "
+                next_token = self.queue.get(True)
+                if next_token is self.job_done:
+                    break
+                history[-1][1] += next_token
+                yield history, " "
             except Empty:
                 break
+        thread.join()
 
         
 
